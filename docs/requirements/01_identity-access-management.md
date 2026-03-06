@@ -131,23 +131,78 @@ graph TD
 ## ユースケース一覧
 
 ### テナント管理
-| # | ユースケース | 実行者 |
-|---|------------|--------|
-| T-01 | テナント登録（初回管理者ユーザーも同時作成） | 未認証ユーザー |
+| # | ユースケース | 実行者 | 優先度 |
+|---|------------|--------|--------|
+| T-01 | テナント登録（初回管理者ユーザーも同時作成） | 未認証ユーザー | 高 |
+| T-02 | テナント情報更新 | TenantAdmin | 中 |
+| T-03 | テナント停止 | システム管理者 | 低 |
+| T-04 | テナント削除（論理削除） | システム管理者 | 低 |
 
 ### 認証
-| # | ユースケース | 実行者 |
-|---|------------|--------|
-| A-01 | ログイン（Email + Password → JWT + RefreshToken） | 未認証ユーザー |
-| A-02 | トークンリフレッシュ | 認証済みユーザー |
-| A-03 | ログアウト（RefreshToken 失効） | 認証済みユーザー |
+| # | ユースケース | 実行者 | 優先度 |
+|---|------------|--------|--------|
+| A-01 | ログイン（Email + Password → JWT + RefreshToken） | 未認証ユーザー | 高 |
+| A-02 | トークンリフレッシュ | 認証済みユーザー | 高 |
+| A-03 | ログアウト（RefreshToken 失効） | 認証済みユーザー | 高 |
+| A-04 | パスワードリセット要求（メール送信） | 未認証ユーザー | 高 |
+| A-05 | パスワードリセット実行（トークン検証） | 未認証ユーザー | 高 |
+| A-06 | メールアドレス検証（招待リンク） | 未認証ユーザー | 中 |
+| A-07 | 全デバイスログアウト（全RefreshToken失効） | 認証済みユーザー | 中 |
 
 ### ユーザー管理
-| # | ユースケース | 実行者 |
-|---|------------|--------|
-| U-01 | ユーザー招待 | TenantAdmin |
-| U-02 | パスワード変更 | 認証済みユーザー（本人） |
-| U-03 | アカウントロック（ログイン失敗 N 回） | システム（自動） |
+| # | ユースケース | 実行者 | 優先度 |
+|---|------------|--------|--------|
+| U-01 | ユーザー招待 | TenantAdmin | 高 |
+| U-02 | パスワード変更 | 認証済みユーザー（本人） | 高 |
+| U-03 | アカウントロック（ログイン失敗 N 回） | システム（自動） | 高 |
+| U-04 | ユーザー一覧取得（テナント内） | TenantAdmin | 高 |
+| U-05 | ユーザー削除（論理削除） | TenantAdmin | 中 |
+| U-06 | ロール変更 | TenantAdmin | 中 |
+| U-07 | アカウントロック解除 | TenantAdmin | 低 |
+
+---
+
+## テナント登録トランザクション戦略
+
+T-01「テナント登録（初回管理者ユーザーも同時作成）」は Tenant 集約と User 集約を同時作成するため、整合性戦略を明確にする。
+
+**初期実装: 単一トランザクション（C案）**
+
+```csharp
+// Application層 - RegisterTenantUseCase
+public async Task<Result> RegisterTenantAsync(RegisterTenantRequest request)
+{
+    using var transaction = await _dbContext.BeginTransactionAsync();
+    try
+    {
+        // 1. Tenant作成
+        var tenant = Tenant.Create(request.TenantName);
+        await _tenantRepository.SaveAsync(tenant);
+
+        // 2. 初回管理者User作成
+        var appUser = new ApplicationUser
+        {
+            TenantId = tenant.Id,
+            DisplayName = request.AdminDisplayName,
+            Email = request.AdminEmail,
+            UserName = request.AdminEmail
+        };
+        await _userManager.CreateAsync(appUser, request.AdminPassword);
+        await _userManager.AddToRoleAsync(appUser, "TenantAdmin");
+
+        await transaction.CommitAsync();
+        return Result.Success();
+    }
+    catch
+    {
+        await transaction.RollbackAsync();
+        return Result.Failure("テナント登録に失敗しました");
+    }
+}
+```
+
+> **方針**: 初期実装は単一トランザクションで整合性を保証する。
+> 将来的にマイクロサービス分割が必要になった場合は、`TenantCreated` ドメインイベント + イベントハンドラによる結果整合性（Saga パターン）への移行を検討する。
 
 ---
 
@@ -211,18 +266,25 @@ src/
 
 ## ログインフロー（ドメインロジックの責務分担）
 
+> **セキュリティ方針**: すべての失敗ケースで同一エラーメッセージ「メールアドレスまたはパスワードが正しくありません」を返す。
+> テナント整合性チェックをパスワード検証より**後**に実施することで、「このメールアドレスは別テナントに存在する」という情報漏洩を防止する。
+
 ```
 LoginUseCase
   │
-  ├─ UserManager<ApplicationUser>.FindByEmailAsync(email)
-  │     → null の場合 → 認証失敗（情報漏洩防止で同一エラーを返す）
+  ├─ [レート制限チェック] IP単位・メールアドレス単位の過剰リクエスト検出
   │
-  ├─ テナント整合性チェック（user.TenantId == requestTenantId）
-  │     → 不一致の場合 → 認証失敗
+  ├─ UserManager<ApplicationUser>.FindByEmailAsync(email)
+  │     → null の場合でも処理を継続（ダミーチェックでタイミング攻撃を防止）
   │
   ├─ SignInManager.CheckPasswordSignInAsync(user, password, lockoutOnFailure: true)
   │     → 失敗カウント・ロックアウトは Identity が自動管理
   │     → SignInResult.IsLockedOut / Succeeded で結果を判定
+  │     → user が null または失敗の場合 → 認証失敗（同一エラー）
+  │
+  ├─ テナント整合性チェック（user.TenantId == requestTenantId）
+  │     → 不一致の場合 → 認証失敗（同一エラー）
+  │     ※ パスワード検証後に実施することで情報漏洩を防止
   │
   ├─ UserManager.GetRolesAsync(user)
   │
@@ -291,11 +353,102 @@ ChangePasswordUseCase
   └─ 変更成功後 → IAuditLogRepository.AppendAsync(PasswordChanged)
 ```
 
+### 推奨インデックス
+
+```sql
+-- Tenant
+CREATE INDEX idx_tenant_status ON Tenant(Status);
+
+-- ApplicationUser
+CREATE INDEX idx_user_tenant ON ApplicationUser(TenantId);
+CREATE INDEX idx_user_email  ON ApplicationUser(NormalizedEmail);
+
+-- RefreshToken
+CREATE UNIQUE INDEX idx_refreshtoken_hashed  ON RefreshToken(HashedToken);
+CREATE INDEX        idx_refreshtoken_user    ON RefreshToken(UserId);
+CREATE INDEX        idx_refreshtoken_expiry  ON RefreshToken(ExpiresAt) WHERE Revoked = false;
+
+-- AuditLog
+CREATE INDEX idx_auditlog_tenant_time ON AuditLog(TenantId, OccurredAt DESC);
+CREATE INDEX idx_auditlog_user        ON AuditLog(UserId);
+CREATE INDEX idx_auditlog_eventtype   ON AuditLog(EventType);
+```
+
 ### 将来の別DB移行手順（参考）
 
 1. `ExternalDbAuditLogRepository` を `Infrastructure/AuditLog/` に追加実装
 2. DI 登録を `EfCoreAuditLogRepository` から差し替え
 3. アプリケーション層・ドメイン層への変更は不要
+
+---
+
+## セキュリティ考慮事項
+
+### JWT 保存場所
+| 方式 | リスク | 採用方針 |
+|------|--------|----------|
+| LocalStorage | XSS で盗取可能 | **非推奨** |
+| HttpOnly Cookie | XSS 耐性あり（CSRF 対策別途要） | **推奨** |
+
+> AccessToken は HttpOnly Cookie に保存し、`SameSite=Strict` を設定する。
+> RefreshToken も同様に HttpOnly Cookie で管理し、LocalStorage への保存は禁止する。
+
+### レート制限
+| エンドポイント | 制限 | ブロック方針 |
+|--------------|------|------------|
+| POST /auth/login | 5回/分（IPアドレス単位） | 429 Too Many Requests |
+| POST /auth/login | 10回/時（メールアドレス単位） | 429 Too Many Requests |
+| POST /auth/token/refresh | 10回/分（ユーザー単位） | 429 Too Many Requests |
+
+### パスワードリセットフロー
+
+```
+A-04: パスワードリセット要求
+  └─ UserManager.FindByEmailAsync(email)
+        → 存在しても/しなくても同一レスポンス（情報漏洩防止）
+        → 存在する場合のみ: 一時トークン生成（有効期限: 1時間）
+        → メール送信（リセットリンク付き）
+
+A-05: パスワードリセット実行
+  └─ トークン検証（有効期限・使用済みチェック）
+        → UserManager.ResetPasswordAsync(user, token, newPassword)
+        → トークン無効化（使用済みマーク）
+        → 全 RefreshToken を失効（セキュリティ）
+```
+
+### CSRF 対策
+RefreshToken Cookie 使用時は `SameSite=Strict` で CSRF を防止する。
+さらに重要操作（パスワード変更、全ログアウト）には再認証を要求する。
+
+### ログイン失敗ロックアウト
+```csharp
+// Infrastructure/Auth/IdentityConfiguration.cs
+options.Lockout.MaxFailedAccessAttempts = 5;   // 5回失敗でロック
+options.Lockout.DefaultLockoutTimeSpan = TimeSpan.FromMinutes(30);
+options.Lockout.AllowedForNewUsers = true;
+```
+
+---
+
+## 運用考慮事項
+
+| # | 項目 | 方針 |
+|---|------|------|
+| O-01 | **RefreshToken クリーンアップ** | 期限切れ・失効済みトークンを日次バッチで削除 |
+| O-02 | **監査ログ保持期間** | 1年間保持。期間超過分は定期アーカイブまたは削除 |
+| O-03 | **テナント削除** | 論理削除（`Status=Deleted`）のみ。物理削除は別途データ保持ポリシーで決定 |
+| O-04 | **同時ログインデバイス制限** | 初期は制限なし（RefreshToken の数で自然に制限）。必要に応じて上限設定を追加 |
+
+---
+
+## パフォーマンス考慮事項
+
+| # | 項目 | 対策 |
+|---|------|------|
+| P-01 | User 取得時の Role ロード | Eager Loading: `.Include(u => u.Roles)` |
+| P-02 | 監査ログ書き込みの遅延 | 非同期処理（`fire-and-forget` or バックグラウンドキュー）で本処理をブロックしない |
+| P-03 | RefreshToken の検索 | `HashedToken` カラムに一意インデックスを付与 |
+| P-04 | 監査ログの範囲クエリ | `(TenantId, OccurredAt)` 複合インデックスを付与 |
 
 ---
 

@@ -2,7 +2,7 @@
 
 **レビュー日**: 2026-03-06
 **対象ドキュメント**: `01_identity-access-management.md`
-**ステータス**: 一部反映済み（2026-03-06）
+**ステータス**: 第2回レビュー完了（2026-03-06）・要対応8件
 
 | 懸念点 | 対応状況 | 備考 |
 |--------|----------|------|
@@ -12,6 +12,132 @@
 | 4. ログインフローのセキュリティ | ✅ 反映済み | テナント整合性チェックをパスワード検証後に移動。レート制限注記を追加 |
 | 5. AuditLogの集約設計 | ⏭️ 対応見送り | 仕様書は既にApplication層からIAuditLogRepository経由で呼ぶ設計であり問題なし |
 | 6. 未決定事項の優先度 | ✅ 反映済み | 未決定事項は仕様書に既存。追加ユースケース・セキュリティ・運用・パフォーマンス・インデックスを反映 |
+
+---
+
+## 第2回レビュー（2026-03-06）
+
+反映済み仕様書に対する再検証結果。
+
+| # | 優先度 | 項目 | 対応状況 |
+|---|--------|------|----------|
+| R2-1 | 🔴 高 | パスワードリセットトークンのドメインモデルが未定義 | 未対応 |
+| R2-2 | 🔴 高 | ログインフロー: null user を CheckPasswordSignInAsync に渡せない | 未対応 |
+| R2-3 | 🟡 中 | システム管理者ロールが未定義（T-03/T-04 の実行者） | 未対応 |
+| R2-4 | 🟡 中 | レイヤー構成に新規ユースケースファイルが未反映 | 未対応 |
+| R2-5 | 🟡 中 | ロックアウト閾値が「未確定」とコード確定値で矛盾 | 未対応 |
+| R2-6 | 🟢 低 | RefreshToken集約 / Session集約の名称不一致 | 未対応 |
+| R2-7 | 🟢 低 | P-01 Eager Loading の記述が不正確 | 未対応 |
+| R2-8 | 🟢 低 | 新規ユースケースの監査ログ記録タイミングが未記載 | 未対応 |
+
+### R2-1. パスワードリセットトークンのドメインモデルが未定義 🔴
+
+A-04/A-05 を実装するには一時トークン（有効期限・使用済み管理）が必要だが、どこにも定義がない。
+
+**決定が必要な事項**:
+```
+選択肢A: ASP.NET Core Identity の GeneratePasswordResetTokenAsync に委譲（推奨）
+  → UserManager がトークン生成・検証を管理
+  → 追加モデル不要だが、メール送信インフラが必要
+  → Infrastructure/Auth/ に PasswordResetEmailService を追加
+
+選択肢B: 独自の一時トークン管理テーブルを設ける
+  → Domain/Auth/PasswordResetToken.cs を追加
+  → 有効期限・使用済みフラグを管理
+```
+
+**推奨**: 選択肢A（Identity に委譲）。追加モデルなしで実装できる。
+
+### R2-2. ログインフロー: null user のダミーチェック問題 🔴
+
+`CheckPasswordSignInAsync(null, ...)` は `NullReferenceException` を投げる。
+現状の仕様記述では実装不可能。
+
+**推奨する修正フロー**:
+```
+LoginUseCase
+  │
+  ├─ UserManager.FindByEmailAsync(email)
+  │
+  ├─ user が null の場合
+  │     → _passwordHasher.VerifyHashedPassword("", password)  // タイミング均一化
+  │     → 認証失敗（同一エラー）
+  │
+  ├─ user が存在する場合
+  │     → SignInManager.CheckPasswordSignInAsync(user, password, lockoutOnFailure: true)
+  │     → 失敗の場合 → 認証失敗（同一エラー）
+  │
+  ├─ テナント整合性チェック ...
+```
+
+### R2-3. システム管理者ロールが未定義 🟡
+
+T-03（テナント停止）・T-04（テナント削除）の実行者「システム管理者」に対応するロールが未定義。
+ロール定義は `TenantAdmin` / `Member` のみ。
+
+**決定が必要な事項**:
+- `SystemAdmin` ロールを追加するか
+- テナント操作は API キー認証など別方式にするか
+
+### R2-4. レイヤー構成に新規ユースケースが未反映 🟡
+
+追加された 10 件のユースケースのファイルが Application/ 層に記載されていない。
+
+```
+Application/
+  ├── Auth/
+  │   ├── PasswordResetRequestUseCase.cs   # A-04
+  │   ├── PasswordResetExecuteUseCase.cs   # A-05
+  │   ├── VerifyEmailUseCase.cs            # A-06
+  │   └── LogoutAllDevicesUseCase.cs       # A-07
+  ├── Tenant/
+  │   ├── UpdateTenantUseCase.cs           # T-02
+  │   ├── SuspendTenantUseCase.cs          # T-03
+  │   └── DeleteTenantUseCase.cs           # T-04
+  └── User/
+      ├── ListUsersUseCase.cs              # U-04
+      ├── DeleteUserUseCase.cs             # U-05
+      ├── ChangeUserRoleUseCase.cs         # U-06
+      └── UnlockUserUseCase.cs            # U-07
+```
+
+### R2-5. ロックアウト閾値の矛盾 🟡
+
+未決定事項テーブルで「**未確定**」とあるが、セキュリティ考慮事項のコードでは 5回・30分 と具体的な値が記載済み。
+
+**推奨**: 未決定事項テーブルの当該行を「**確定**（5回失敗で30分ロック）」に変更する。
+
+### R2-6. RefreshToken集約 / Session集約の名称不一致 🟢
+
+- 境界コンテキスト図: `SA["Session 集約"]`
+- ドメインモデルの見出し: `### RefreshToken 集約`
+- レイヤー構成: `Domain/Session/`
+
+**推奨**: 「Session 集約」に統一（より意味が広く、将来的な拡張に対応しやすい）。
+
+### R2-7. P-01 Eager Loading の記述が不正確 🟢
+
+`.Include(u => u.Roles)` は ASP.NET Core Identity の標準 many-to-many 構造では動作しない。
+
+```csharp
+// 正しくは（ApplicationUser に UserRoles ナビゲーションプロパティを追加した上で）
+.Include(u => u.UserRoles)
+    .ThenInclude(ur => ur.Role)
+```
+
+### R2-8. 新規ユースケースの監査ログ記録が未記載 🟢
+
+以下のイベントが記録対象一覧・記録タイミング例に未追加:
+
+| ユースケース | 追加すべきイベント種別 |
+|------------|----------------------|
+| A-04 パスワードリセット要求 | `auth.password.reset.request` |
+| A-05 パスワードリセット実行 | `auth.password.reset.complete` |
+| A-07 全デバイスログアウト | `auth.logout.all_devices` |
+| U-05 ユーザー削除 | `user.deleted` |
+| U-06 ロール変更 | `user.role.changed`（既存） |
+| T-03 テナント停止 | `tenant.suspended`（既存） |
+| T-04 テナント削除 | `tenant.deleted` |
 
 ---
 

@@ -444,7 +444,7 @@ public class AuditLogEventHandler :
 
 | 項目 | 現状 | 推奨 | 理由 |
 |------|------|------|------|
-| **マルチテナント分離方式** | 未定 | スキーマ分離 | アーキテクチャ全体に影響。DB設計・クエリ実装が大きく変わる |
+| **マルチテナント分離方式** | 未定 | シングルDB + TenantId | シンプルで実装コストが低い。行レベルでテナント分離 |
 | **JWT方式** | 未定 | AccessToken（15分）+ RefreshToken（7日）ローテーション | セキュリティとUXのバランス |
 | **ログイン失敗ロック閾値** | 未定 | 5回失敗で30分ロック | セキュリティポリシーとして明確化 |
 
@@ -452,7 +452,7 @@ public class AuditLogEventHandler :
 
 | 項目 | 現状 | 推奨 |
 |------|------|------|
-| DB | PostgreSQL推奨 | PostgreSQL（スキーマ分離対応） |
+| DB | PostgreSQL推奨 | PostgreSQL |
 | パスワードポリシー | 未定 | 最低8文字、大小英数字+記号 |
 | RefreshToken有効期限 | 未定 | 7日間 |
 
@@ -514,34 +514,9 @@ CREATE INDEX idx_auditlog_user ON AuditLog(UserId);
 CREATE INDEX idx_auditlog_eventtype ON AuditLog(EventType);
 ```
 
-### マルチテナント分離方式の比較
+### マルチテナント分離方式
 
-| 方式 | メリット | デメリット | 推奨度 |
-|------|---------|-----------|--------|
-| **シングルDB + TenantId** | シンプル、コスト低 | データ漏洩リスク高、スケール困難 | ❌ 非推奨 |
-| **スキーマ分離** | セキュリティ向上、スケール可能 | 複雑度中、マイグレーション管理 | ✅ 推奨 |
-| **DB分離** | 最高セキュリティ、独立スケール | 複雑度高、コスト高 | △ エンタープライズ向け |
-
-**推奨**: スキーマ分離方式
-
-```csharp
-// 実装例
-public class TenantDbContext : IdentityDbContext<ApplicationUser>
-{
-    private readonly string _tenantSchema;
-    
-    public TenantDbContext(string tenantSchema)
-    {
-        _tenantSchema = tenantSchema;
-    }
-    
-    protected override void OnModelCreating(ModelBuilder builder)
-    {
-        builder.HasDefaultSchema(_tenantSchema);
-        // ...
-    }
-}
-```
+**確定**: シングルDB + TenantId による行レベル分離
 
 ---
 

@@ -8,6 +8,13 @@ DDDアーキテクチャを採用し、テナント管理・ユーザー管理�
 **スコープ**: バックエンド API に特化。フロントエンドは別チームが担当するため本設計の対象外とする。
 **技術スタック**: C# / ASP.NET Core MVC（Web API）/ ASP.NET Core Identity
 
+### 設計上のトレードオフ（意図的な決定）
+
+| 項目 | 決定内容 | 理由 |
+|------|---------|------|
+| User集約のIdentity依存 | `ApplicationUser : IdentityUser<Guid>` をドメイン層に配置 | ASP.NET Core Identityとの統合コストを優先。純粋DDD原則より実用性を選択 |
+| Session集約の独立 | RefreshTokenをUser集約から分離した独立集約として管理 | ユーザーロード時のN+1回避、スケーラビリティ確保のため |
+
 ### ASP.NET Core Identity の責務範囲
 
 Identity フレームワークに委譲する機能と、ドメイン層で管理する機能を以下のように分離する。
@@ -19,6 +26,7 @@ Identity フレームワークに委譲する機能と、ドメイン層で管�
 | パスワード強度バリデーション | Identity（`PasswordOptions` 設定） |
 | ロール管理 | Identity（`RoleManager<IdentityRole>`） |
 | ユーザーストア（CRUD） | Identity（`UserManager<T>`） |
+| パスワードリセットトークン生成・検証 | Identity（`GeneratePasswordResetTokenAsync`） |
 | テナント管理 | ドメイン層（`Tenant` 集約） |
 | JWT 発行・RefreshToken 管理 | アプリケーション層 ＋ インフラ層 |
 | テナント境界の認可制御 | アプリケーション層 |
@@ -36,7 +44,7 @@ graph TD
 
         subgraph UA["User 集約（ASP.NET Core Identity 管理）"]
             AppUser["ApplicationUser\n───────────────\nTenantId\nDisplayName\nCreatedAt\n+ IdentityUser fields"]
-            AppRole["ApplicationRole\n───────────────\nTenantAdmin / Member"]
+            AppRole["ApplicationRole\n───────────────\nTenantAdmin / Member / SystemAdmin"]
         end
 
         subgraph SA["Session 集約"]
@@ -104,6 +112,7 @@ graph TD
 | LockoutEnabled | ロック機能有効フラグ |
 
 **ロール定義**（`IdentityRole` で管理）
+- `SystemAdmin`: システム管理者（テナント停止・削除など全テナント横断操作）
 - `TenantAdmin`: テナント管理者
 - `Member`: 一般メンバー
 
@@ -115,7 +124,9 @@ graph TD
 
 ---
 
-### RefreshToken 集約
+### Session 集約
+
+> **命名統一**: 境界コンテキスト図・ドメインモデル・レイヤー構成すべて「Session 集約」に統一する。
 
 | 要素 | 型 | 説明 |
 |------|----|------|
@@ -135,8 +146,8 @@ graph TD
 |---|------------|--------|--------|
 | T-01 | テナント登録（初回管理者ユーザーも同時作成） | 未認証ユーザー | 高 |
 | T-02 | テナント情報更新 | TenantAdmin | 中 |
-| T-03 | テナント停止 | システム管理者 | 低 |
-| T-04 | テナント削除（論理削除） | システム管理者 | 低 |
+| T-03 | テナント停止 | SystemAdmin | 低 |
+| T-04 | テナント削除（論理削除） | SystemAdmin | 低 |
 
 ### 認証
 | # | ユースケース | 実行者 | 優先度 |
@@ -221,7 +232,7 @@ src/
 │   │   ├── ApplicationUser.cs     # 集約ルート（IdentityUser<Guid> 継承）
 │   │   └── ApplicationRole.cs     # ロール定義（IdentityRole<Guid> 継承）
 │   │   # ※ Email・パスワード・ロックアウトは Identity 管理のため値オブジェクト不要
-│   ├── Session/
+│   ├── Session/                   # Session 集約（RefreshToken管理）
 │   │   ├── RefreshToken.cs
 │   │   └── IRefreshTokenRepository.cs
 │   ├── AuditLog/
@@ -232,14 +243,25 @@ src/
 │
 ├── Application/
 │   ├── Tenant/
-│   │   └── RegisterTenantUseCase.cs
+│   │   ├── RegisterTenantUseCase.cs
+│   │   ├── UpdateTenantUseCase.cs           # T-02
+│   │   ├── SuspendTenantUseCase.cs          # T-03
+│   │   └── DeleteTenantUseCase.cs           # T-04
 │   ├── Auth/
 │   │   ├── LoginUseCase.cs
 │   │   ├── RefreshTokenUseCase.cs
-│   │   └── LogoutUseCase.cs
+│   │   ├── LogoutUseCase.cs
+│   │   ├── PasswordResetRequestUseCase.cs   # A-04
+│   │   ├── PasswordResetExecuteUseCase.cs   # A-05
+│   │   ├── VerifyEmailUseCase.cs            # A-06
+│   │   └── LogoutAllDevicesUseCase.cs       # A-07
 │   └── User/
 │       ├── InviteUserUseCase.cs
-│       └── ChangePasswordUseCase.cs
+│       ├── ChangePasswordUseCase.cs
+│       ├── ListUsersUseCase.cs              # U-04
+│       ├── DeleteUserUseCase.cs             # U-05
+│       ├── ChangeUserRoleUseCase.cs         # U-06
+│       └── UnlockUserUseCase.cs            # U-07
 │
 ├── Infrastructure/
 │   ├── Persistence/
@@ -249,6 +271,7 @@ src/
 │   │   └── EfCoreAuditLogRepository.cs     # IAuditLogRepository の初期実装（同一DB）
 │   └── Auth/
 │       ├── JwtService.cs
+│       ├── PasswordResetEmailService.cs    # A-04/A-05 メール送信
 │       └── IdentityConfiguration.cs        # LockoutOptions / PasswordOptions 設定
 │
 └── WebApi/                        # ASP.NET Core MVC（フロントエンド連携はAPI経由）
@@ -275,12 +298,16 @@ LoginUseCase
   ├─ [レート制限チェック] IP単位・メールアドレス単位の過剰リクエスト検出
   │
   ├─ UserManager<ApplicationUser>.FindByEmailAsync(email)
-  │     → null の場合でも処理を継続（ダミーチェックでタイミング攻撃を防止）
   │
-  ├─ SignInManager.CheckPasswordSignInAsync(user, password, lockoutOnFailure: true)
+  ├─ user が null の場合
+  │     → _passwordHasher.VerifyHashedPassword("", password)  // タイミング均一化（NullReferenceException防止）
+  │     → 認証失敗（同一エラー）
+  │
+  ├─ user が存在する場合
+  │     → SignInManager.CheckPasswordSignInAsync(user, password, lockoutOnFailure: true)
   │     → 失敗カウント・ロックアウトは Identity が自動管理
   │     → SignInResult.IsLockedOut / Succeeded で結果を判定
-  │     → user が null または失敗の場合 → 認証失敗（同一エラー）
+  │     → 失敗の場合 → 認証失敗（同一エラー）
   │
   ├─ テナント整合性チェック（user.TenantId == requestTenantId）
   │     → 不一致の場合 → 認証失敗（同一エラー）
@@ -317,9 +344,9 @@ Application 層
 
 | カテゴリ | イベント種別 |
 |---------|------------|
-| 認証 | `auth.login.success` / `auth.login.failed` / `auth.lockout` / `auth.logout` / `auth.token.refresh` |
-| ユーザー管理 | `user.created` / `user.invited` / `user.password.changed` / `user.role.changed` |
-| テナント管理 | `tenant.created` / `tenant.suspended` |
+| 認証 | `auth.login.success` / `auth.login.failed` / `auth.lockout` / `auth.logout` / `auth.token.refresh` / `auth.logout.all_devices` / `auth.password.reset.request` / `auth.password.reset.complete` |
+| ユーザー管理 | `user.created` / `user.invited` / `user.password.changed` / `user.role.changed` / `user.deleted` |
+| テナント管理 | `tenant.created` / `tenant.suspended` / `tenant.deleted` |
 
 ### AuditLog テーブル設計
 
@@ -341,16 +368,39 @@ Application 層
 
 ```
 LoginUseCase
-  │
-  ├─ 認証成功 → IAuditLogRepository.AppendAsync(LoginSucceeded)
-  ├─ 認証失敗 → IAuditLogRepository.AppendAsync(LoginFailed)
-  └─ ロックアウト → IAuditLogRepository.AppendAsync(AccountLockedOut)
+  ├─ 認証成功 → IAuditLogRepository.AppendAsync(auth.login.success)
+  ├─ 認証失敗 → IAuditLogRepository.AppendAsync(auth.login.failed)
+  └─ ロックアウト → IAuditLogRepository.AppendAsync(auth.lockout)
+
+LogoutUseCase
+  └─ ログアウト → IAuditLogRepository.AppendAsync(auth.logout)
+
+LogoutAllDevicesUseCase
+  └─ 全デバイスログアウト → IAuditLogRepository.AppendAsync(auth.logout.all_devices)
+
+PasswordResetRequestUseCase
+  └─ リセット要求 → IAuditLogRepository.AppendAsync(auth.password.reset.request)
+
+PasswordResetExecuteUseCase
+  └─ リセット完了 → IAuditLogRepository.AppendAsync(auth.password.reset.complete)
 
 InviteUserUseCase
-  └─ ユーザー作成後 → IAuditLogRepository.AppendAsync(UserInvited)
+  └─ ユーザー作成後 → IAuditLogRepository.AppendAsync(user.invited)
 
 ChangePasswordUseCase
-  └─ 変更成功後 → IAuditLogRepository.AppendAsync(PasswordChanged)
+  └─ 変更成功後 → IAuditLogRepository.AppendAsync(user.password.changed)
+
+DeleteUserUseCase
+  └─ 削除後 → IAuditLogRepository.AppendAsync(user.deleted)
+
+ChangeUserRoleUseCase
+  └─ ロール変更後 → IAuditLogRepository.AppendAsync(user.role.changed)
+
+SuspendTenantUseCase
+  └─ 停止後 → IAuditLogRepository.AppendAsync(tenant.suspended)
+
+DeleteTenantUseCase
+  └─ 削除後 → IAuditLogRepository.AppendAsync(tenant.deleted)
 ```
 
 ### 推奨インデックス
@@ -363,7 +413,7 @@ CREATE INDEX idx_tenant_status ON Tenant(Status);
 CREATE INDEX idx_user_tenant ON ApplicationUser(TenantId);
 CREATE INDEX idx_user_email  ON ApplicationUser(NormalizedEmail);
 
--- RefreshToken
+-- RefreshToken（Session集約）
 CREATE UNIQUE INDEX idx_refreshtoken_hashed  ON RefreshToken(HashedToken);
 CREATE INDEX        idx_refreshtoken_user    ON RefreshToken(UserId);
 CREATE INDEX        idx_refreshtoken_expiry  ON RefreshToken(ExpiresAt) WHERE Revoked = false;
@@ -400,20 +450,23 @@ CREATE INDEX idx_auditlog_eventtype   ON AuditLog(EventType);
 | POST /auth/login | 10回/時（メールアドレス単位） | 429 Too Many Requests |
 | POST /auth/token/refresh | 10回/分（ユーザー単位） | 429 Too Many Requests |
 
-### パスワードリセットフロー
+### パスワードリセットフロー（A-04 / A-05）
+
+パスワードリセットトークンは ASP.NET Core Identity の `GeneratePasswordResetTokenAsync` に委譲する。
+追加のドメインモデルは不要。メール送信インフラとして `Infrastructure/Auth/PasswordResetEmailService.cs` を追加する。
 
 ```
 A-04: パスワードリセット要求
   └─ UserManager.FindByEmailAsync(email)
         → 存在しても/しなくても同一レスポンス（情報漏洩防止）
-        → 存在する場合のみ: 一時トークン生成（有効期限: 1時間）
-        → メール送信（リセットリンク付き）
+        → 存在する場合のみ:
+            UserManager.GeneratePasswordResetTokenAsync(user)  // Identity に委譲
+            PasswordResetEmailService.SendAsync(email, token)  // メール送信（有効期限: 1時間）
 
 A-05: パスワードリセット実行
-  └─ トークン検証（有効期限・使用済みチェック）
-        → UserManager.ResetPasswordAsync(user, token, newPassword)
-        → トークン無効化（使用済みマーク）
-        → 全 RefreshToken を失効（セキュリティ）
+  └─ UserManager.FindByEmailAsync(email)
+        → UserManager.ResetPasswordAsync(user, token, newPassword)  // Identity がトークン検証
+        → IRefreshTokenRepository.RevokeAllByUserId(userId)  // 全RefreshToken失効（セキュリティ）
 ```
 
 ### CSRF 対策
@@ -445,7 +498,7 @@ options.Lockout.AllowedForNewUsers = true;
 
 | # | 項目 | 対策 |
 |---|------|------|
-| P-01 | User 取得時の Role ロード | Eager Loading: `.Include(u => u.Roles)` |
+| P-01 | User 取得時の Role ロード | Eager Loading: `.Include(u => u.UserRoles).ThenInclude(ur => ur.Role)`（Identity の many-to-many 構造に対応） |
 | P-02 | 監査ログ書き込みの遅延 | 非同期処理（`fire-and-forget` or バックグラウンドキュー）で本処理をブロックしない |
 | P-03 | RefreshToken の検索 | `HashedToken` カラムに一意インデックスを付与 |
 | P-04 | 監査ログの範囲クエリ | `(TenantId, OccurredAt)` 複合インデックスを付与 |
@@ -460,7 +513,8 @@ options.Lockout.AllowedForNewUsers = true;
 | 認証ライブラリ | ASP.NET Core Identity | **確定** |
 | フロントエンド | 別チーム担当・本設計の対象外 | **確定** |
 | 監査ログ保存方式 | A案（同一DB・専用テーブル）で初期実装。`IAuditLogRepository` で抽象化し将来B案（別DB）へ移行可能 | **確定** |
-| DB | PostgreSQL 推奨（スキーマ分離対応可能） | 未確定 |
-| JWT方式 | 短命AccessToken + RefreshTokenローテーション推奨 | 未確定 |
-| マルチテナント分離方式 | 未定（シングルDB / スキーマ分離 / DB分離） | 未確定 |
-| ログイン失敗ロック閾値 | Identity の `MaxFailedAccessAttempts` で設定（例：5回） | 未確定 |
+| ログイン失敗ロック閾値 | 5回失敗で30分ロック（`MaxFailedAccessAttempts=5`, `DefaultLockoutTimeSpan=30min`） | **確定** |
+| DB | PostgreSQL 推奨 | 未確定 |
+| JWT方式 | 短命AccessToken（15分推奨）+ RefreshTokenローテーション（7日推奨） | 未確定 |
+| マルチテナント分離方式 | シングルDB（TenantId による行レベル分離） | **確定** |
+| SystemAdmin 認証方式 | `SystemAdmin` ロール or APIキー認証 | 未確定 |

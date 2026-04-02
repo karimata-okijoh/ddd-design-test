@@ -152,6 +152,7 @@ graph TD
 | T-02 | テナント情報更新 | TenantAdmin | 中 |
 | T-03 | テナント停止 | SystemAdmin | 低 |
 | T-04 | テナント削除（論理削除） | SystemAdmin | 低 |
+| T-05 | テナントデータ使用量取得 | TenantAdmin / SystemAdmin | 中 |
 
 ### 認証
 | # | ユースケース | 実行者 | 優先度 |
@@ -250,7 +251,8 @@ src/
 │   │   ├── RegisterTenantUseCase.cs
 │   │   ├── UpdateTenantUseCase.cs           # T-02
 │   │   ├── SuspendTenantUseCase.cs          # T-03
-│   │   └── DeleteTenantUseCase.cs           # T-04
+│   │   ├── DeleteTenantUseCase.cs           # T-04
+│   │   └── GetTenantUsageUseCase.cs         # T-05
 │   ├── Auth/
 │   │   ├── LoginUseCase.cs
 │   │   ├── RefreshTokenUseCase.cs
@@ -484,6 +486,36 @@ options.Lockout.MaxFailedAccessAttempts = 5;   // 5回失敗でロック
 options.Lockout.DefaultLockoutTimeSpan = TimeSpan.FromMinutes(30);
 options.Lockout.AllowedForNewUsers = true;
 ```
+
+---
+
+## テナントデータ使用量設計
+
+### 集計対象
+
+| 項目 | 集計方法 |
+|------|---------|
+| ユーザー数 | `ApplicationUser` テーブルの `TenantId` 別カウント（論理削除済みを除く） |
+| 監査ログ件数 | `AuditLog` テーブルの `TenantId` 別カウント |
+| 監査ログサイズ（概算） | 件数 × 平均レコードサイズで推計 |
+
+### API レスポンス例
+
+```json
+GET /tenants/{tenantId}/usage
+
+{
+  "tenantId": "...",
+  "userCount": 42,
+  "auditLogCount": 15320,
+  "auditLogSizeBytes": 4596000,
+  "measuredAt": "2026-04-02T00:00:00Z"
+}
+```
+
+### 認可
+- `TenantAdmin`: 自テナントの使用量のみ参照可
+- `SystemAdmin`: 全テナントの使用量を参照可
 
 ---
 

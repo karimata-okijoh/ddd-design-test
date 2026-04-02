@@ -98,13 +98,17 @@ graph TD
 |------|----|------|
 | TenantId | Guid | 所属テナント識別子 |
 | DisplayName | string | 表示名 |
+| ContactEmail | string（必須） | 連絡用メールアドレス。Gmail 等の外部メールアドレスを登録。ログイン用 Email とは独立して管理 |
 | CreatedAt | DateTime | 作成日時 |
+
+> `ContactEmail` はユーザー登録時に必須入力。パスワードリセットメールや通知の送信先として使用する。
+> ログイン用 `Email`（Identity 管理）とは別フィールドとして扱い、変更時は本人確認を要求する。
 
 **Identity が管理するプロパティ（継承元 IdentityUser）**
 
 | 要素 | 説明 |
 |------|------|
-| Id（UserId） | ユーザー識別子（Guid） |
+| Id（UserId） | ユーザー識別子（Guid）。**システムが自動採番**（`Guid.NewGuid()`）し、クライアントからの指定は不可 |
 | Email / NormalizedEmail | メールアドレス |
 | PasswordHash | パスワードHash |
 | AccessFailedCount | ログイン失敗カウント |
